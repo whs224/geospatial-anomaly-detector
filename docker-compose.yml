@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgis/postgis:15-3.3
+    container_name: geo-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: geospatial_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ingestor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: geo-ingestor
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: geospatial_db
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+    volumes:
+      - ./main.py:/app/main.py
+    restart: unless-stopped
+
+  detector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: geo-detector
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: geospatial_db
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+    volumes:
+      - ./detector.py:/app/detector.py
+    command: ["python", "detector.py"]
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: geo-api
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: geospatial_db
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+    volumes:
+      - ./api.py:/app/api.py
+    command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--reload"]
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+

@@ -1,0 +1,6 @@
+psycopg2-binary==2.9.9
+requests==2.31.0
+schedule==1.2.0
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+
