@@ -37,4 +37,4 @@ Prerequisites: Docker & Docker Compose.
 * **Decoupled Architecture:** By separating the *Detector* from the *Ingestor*, the system remains resilient. If the analysis logic hangs on a complex query, the data ingestion continues uninterrupted.
 
 ## 📸 Screenshot
-![Dashboard Screenshot](link-to-your-screenshot.png)
+![Dashboard Screenshot](demo.png)
