@@ -22,8 +22,8 @@ Prerequisites: Docker & Docker Compose.
 
 1.  **Clone the repo:**
     ```bash
-    git clone [https://github.com/yourusername/geo-project.git](https://github.com/yourusername/geo-project.git)
-    cd geo-project
+    git clone https://github.com/whs224/geospatial-anomaly-detector.git
+    cd geospatial-anomaly-detector
     ```
 2.  **Start the pipeline:**
     ```bash
