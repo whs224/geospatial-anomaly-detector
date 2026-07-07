@@ -1,267 +1,211 @@
 #!/usr/bin/env python3
-"""
-Real-Time Geospatial Anomaly Detector - Data Ingestion Script
-Fetches flight data from OpenSky Network API and stores it in PostgreSQL with PostGIS
+"""Data ingestion service.
+
+Fetches state vectors from the OpenSky Network for the configured bounding
+box, batch-inserts them idempotently into PostgreSQL/PostGIS, and prunes
+position history past the retention window.
 """
 
-import os
+import logging
+import sys
 import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
 import psycopg2
-import requests
-from datetime import datetime
-from typing import Optional, List, Dict, Any
+from psycopg2.extras import execute_values
 
-# Database connection parameters
-DB_HOST = os.getenv('DB_HOST', 'localhost')
-DB_PORT = os.getenv('DB_PORT', '5432')
-DB_NAME = os.getenv('DB_NAME', 'geospatial_db')
-DB_USER = os.getenv('DB_USER', 'postgres')
-DB_PASSWORD = os.getenv('DB_PASSWORD', 'postgres')
+import config
+import db
+import runtime
+from opensky import OpenSkyClient, OpenSkyError, RateLimitedError
 
-# OpenSky Network API endpoint
-OPENSKY_API_URL = "https://opensky-network.org/api/states/all"
+logger = logging.getLogger('ingestor')
 
-# Switzerland bounding box
-SWITZERLAND_BBOX = {
-    'lamin': 45.8,
-    'lomin': 5.9,
-    'lamax': 47.8,
-    'lomax': 10.5
-}
+INSERT_QUERY = """
+    INSERT INTO flight_positions
+        (icao24, callsign, velocity, heading, last_contact, geom)
+    VALUES %s
+    ON CONFLICT (icao24, last_contact) DO NOTHING
+    RETURNING 1
+"""
+INSERT_TEMPLATE = '(%s, %s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))'
 
-# Fetch interval in seconds
-FETCH_INTERVAL = 10
-
-
-def get_db_connection() -> psycopg2.extensions.connection:
-    """Establish connection to PostgreSQL database."""
-    try:
-        conn = psycopg2.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD
-        )
-        return conn
-    except psycopg2.Error as e:
-        print(f"Error connecting to database: {e}")
-        raise
+PRUNE_POSITIONS_QUERY = """
+    DELETE FROM flight_positions
+    WHERE last_contact < now() - make_interval(hours => %s)
+"""
+PRUNE_EVENTS_QUERY = """
+    DELETE FROM anomaly_events
+    WHERE detected_at < now() - make_interval(hours => %s)
+"""
 
 
-def fetch_flight_data() -> Optional[List[List[Any]]]:
-    """
-    Fetch flight data from OpenSky Network API for Switzerland region.
-    
-    Returns:
-        List of flight state vectors or None if request fails
-    """
-    try:
-        params = {
-            'lamin': SWITZERLAND_BBOX['lamin'],
-            'lomin': SWITZERLAND_BBOX['lomin'],
-            'lamax': SWITZERLAND_BBOX['lamax'],
-            'lomax': SWITZERLAND_BBOX['lomax']
-        }
-        
-        response = requests.get(OPENSKY_API_URL, params=params, timeout=10)
-        response.raise_for_status()
-        
-        data = response.json()
-        
-        if 'states' in data and data['states']:
-            return data['states']
-        else:
-            print("No flight data returned from API")
-            return []
-            
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching data from OpenSky API: {e}")
-        return None
-    except Exception as e:
-        print(f"Unexpected error fetching flight data: {e}")
-        return None
+def parse_flight_state(state_vector: Any) -> Optional[Dict[str, Any]]:
+    """Parse one OpenSky state vector into a row dict.
 
+    Returns None for vectors that should not be stored: missing coordinates
+    or timestamp, or on-ground traffic (taxiing aircraft and airport ground
+    vehicles would pollute both the map and the kinematic detection).
 
-def parse_flight_state(state_vector: List[Any]) -> Optional[Dict[str, Any]]:
-    """
-    Parse OpenSky Network state vector into structured format.
-    
     OpenSky state vector format:
     [0] icao24, [1] callsign, [2] origin_country, [3] time_position,
     [4] last_contact, [5] longitude, [6] latitude, [7] baro_altitude,
     [8] on_ground, [9] velocity, [10] heading, [11] vertical_rate,
-    [12] sensors, [13] geo_altitude, [14] squawk, [15] spi, [16] position_source
+    [12] sensors, [13] geo_altitude, [14] squawk, [15] spi,
+    [16] position_source
     """
-    try:
-        # Extract fields - handle None values
-        icao24 = state_vector[0] if state_vector[0] else None
-        callsign = state_vector[1].strip() if state_vector[1] else None
-        last_contact = state_vector[4]
-        longitude = state_vector[5]
-        latitude = state_vector[6]
-        velocity = state_vector[9]
-        heading = state_vector[10]
-        
-        # Critical: Filter out rows with null latitude/longitude
-        if latitude is None or longitude is None:
-            return None
-        
-        # Convert last_contact from Unix timestamp to datetime
-        if last_contact:
-            last_contact_dt = datetime.fromtimestamp(last_contact)
-        else:
-            last_contact_dt = datetime.now()
-        
-        return {
-            'icao24': icao24,
-            'callsign': callsign,
-            'velocity': velocity,
-            'heading': heading,
-            'last_contact': last_contact_dt,
-            'longitude': longitude,
-            'latitude': latitude
-        }
-    except (IndexError, ValueError, TypeError) as e:
-        print(f"Error parsing flight state: {e}")
+    if not isinstance(state_vector, (list, tuple)) or len(state_vector) < 17:
         return None
 
+    icao24 = state_vector[0]
+    raw_callsign = state_vector[1]
+    last_contact = state_vector[4]
+    longitude = state_vector[5]
+    latitude = state_vector[6]
+    on_ground = state_vector[8]
+    velocity = state_vector[9]
+    heading = state_vector[10]
 
-def insert_flight_data(conn: psycopg2.extensions.connection, flight_data: List[Dict[str, Any]]) -> int:
+    # icao24 is part of the primary key; an empty string is as useless as None.
+    if not icao24 or last_contact is None:
+        return None
+    if latitude is None or longitude is None:
+        return None
+    if on_ground:
+        return None
+
+    callsign = raw_callsign.strip() if raw_callsign else None
+    return {
+        'icao24': icao24,
+        'callsign': callsign or None,
+        'velocity': velocity,
+        'heading': heading,
+        'last_contact': datetime.fromtimestamp(last_contact, tz=timezone.utc),
+        'longitude': longitude,
+        'latitude': latitude,
+    }
+
+
+def insert_positions(conn: psycopg2.extensions.connection,
+                     flights: List[Dict[str, Any]]) -> int:
+    """Batch-insert parsed positions; returns the number of new rows.
+
+    Re-polled state vectors (same icao24 + last_contact) are dropped by the
+    unique constraint, so ingestion is idempotent.
     """
-    Insert flight data into PostgreSQL using PostGIS.
-    
-    Args:
-        conn: Database connection
-        flight_data: List of parsed flight data dictionaries
-        
-    Returns:
-        Number of records inserted
-    """
-    if not flight_data:
+    if not flights:
         return 0
-    
-    cursor = conn.cursor()
-    inserted_count = 0
-    
-    try:
-        insert_query = """
-            INSERT INTO flight_positions (icao24, callsign, velocity, heading, last_contact, geom)
-            VALUES (%s, %s, %s, %s, %s, ST_SetSRID(ST_MakePoint(%s, %s), 4326))
-        """
-        
-        for flight in flight_data:
-            try:
-                cursor.execute(
-                    insert_query,
-                    (
-                        flight['icao24'],
-                        flight['callsign'],
-                        flight['velocity'],
-                        flight['heading'],
-                        flight['last_contact'],
-                        flight['longitude'],
-                        flight['latitude']
-                    )
-                )
-                inserted_count += 1
-            except psycopg2.Error as e:
-                print(f"Error inserting flight data: {e}")
-                continue
-        
-        conn.commit()
-        print(f"Successfully inserted {inserted_count} flight positions")
-        
-    except psycopg2.Error as e:
-        conn.rollback()
-        print(f"Database error during insert: {e}")
-    finally:
-        cursor.close()
-    
-    return inserted_count
+    rows = [
+        (f['icao24'], f['callsign'], f['velocity'], f['heading'],
+         f['last_contact'], f['longitude'], f['latitude'])
+        for f in flights
+    ]
+    with conn.cursor() as cursor:
+        inserted = execute_values(
+            cursor, INSERT_QUERY, rows, template=INSERT_TEMPLATE,
+            page_size=500, fetch=True)
+    conn.commit()
+    return len(inserted)
 
 
-def ingest_cycle():
-    """Single cycle of data ingestion: fetch, parse, and insert."""
-    print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting ingestion cycle...")
-    
-    # Fetch data from API
-    states = fetch_flight_data()
-    
-    if states is None:
-        print("Failed to fetch data, skipping this cycle")
-        return
-    
-    if not states:
-        print("No flight data available")
-        return
-    
-    # Parse and filter flight data
-    parsed_flights = []
-    for state in states:
-        parsed = parse_flight_state(state)
-        if parsed:  # Only include non-null lat/lon flights
-            parsed_flights.append(parsed)
-    
-    print(f"Parsed {len(parsed_flights)} valid flight positions (filtered {len(states) - len(parsed_flights)} with null coordinates)")
-    
-    if not parsed_flights:
-        print("No valid flight positions to insert")
-        return
-    
-    # Insert into database
-    try:
-        conn = get_db_connection()
-        inserted = insert_flight_data(conn, parsed_flights)
-        conn.close()
-    except Exception as e:
-        print(f"Error in database operation: {e}")
+def prune_old_rows(conn: psycopg2.extensions.connection) -> tuple:
+    """Delete positions and anomaly events past the retention window."""
+    with conn.cursor() as cursor:
+        cursor.execute(PRUNE_POSITIONS_QUERY, (config.RETENTION_HOURS,))
+        positions = cursor.rowcount
+        cursor.execute(PRUNE_EVENTS_QUERY, (config.RETENTION_HOURS,))
+        events = cursor.rowcount
+    conn.commit()
+    return positions, events
 
 
-def main():
-    """Main loop that runs ingestion every 10 seconds."""
-    print("=" * 60)
-    print("Real-Time Geospatial Anomaly Detector - Data Ingestion")
-    print("=" * 60)
-    print(f"Database: {DB_HOST}:{DB_PORT}/{DB_NAME}")
-    print(f"Fetch interval: {FETCH_INTERVAL} seconds")
-    print(f"Target region: Switzerland (bbox: {SWITZERLAND_BBOX})")
-    print("=" * 60)
-    
-    # Wait for database to be ready
-    print("Waiting for database connection...")
-    max_retries = 30
-    retry_count = 0
-    
-    while retry_count < max_retries:
+def run_loop() -> None:
+    client = OpenSkyClient()
+    conn: Optional[psycopg2.extensions.connection] = None
+    backoff = float(config.FETCH_INTERVAL_SECONDS)
+    last_prune: Optional[float] = None
+
+    while True:
+        runtime.heartbeat()
+        delay = float(config.FETCH_INTERVAL_SECONDS)
         try:
-            conn = get_db_connection()
-            conn.close()
-            print("Database connection established!")
-            break
-        except psycopg2.Error:
-            retry_count += 1
-            print(f"Retrying database connection ({retry_count}/{max_retries})...")
-            time.sleep(2)
-    else:
-        print("Failed to connect to database after maximum retries")
-        return
-    
-    # Main ingestion loop
-    print(f"\nStarting ingestion loop (every {FETCH_INTERVAL} seconds)...")
-    print("Press Ctrl+C to stop\n")
-    
+            states = client.fetch_states()
+            flights = [
+                parsed for parsed in map(parse_flight_state, states) if parsed
+            ]
+            if conn is None or conn.closed:
+                conn = db.connect()
+            inserted = insert_positions(conn, flights)
+            logger.info(
+                'Fetched %d state vectors, kept %d airborne with coordinates, '
+                'inserted %d new positions',
+                len(states), len(flights), inserted)
+
+            if (last_prune is None
+                    or time.monotonic() - last_prune
+                    >= config.PRUNE_INTERVAL_SECONDS):
+                pruned_positions, pruned_events = prune_old_rows(conn)
+                last_prune = time.monotonic()
+                if pruned_positions or pruned_events:
+                    logger.info(
+                        'Pruned %d positions and %d anomaly events older '
+                        'than %dh', pruned_positions, pruned_events,
+                        config.RETENTION_HOURS)
+
+            backoff = float(config.FETCH_INTERVAL_SECONDS)
+        except RateLimitedError as exc:
+            backoff = min(backoff * 2, config.BACKOFF_MAX_SECONDS)
+            delay = max(exc.retry_after or 0.0, backoff)
+            hint = ('' if client.authenticated else
+                    ' — anonymous access gets ~400 credits/day; set '
+                    'OPENSKY_CLIENT_ID/OPENSKY_CLIENT_SECRET for 4000')
+            logger.warning('%s; backing off %.0fs%s', exc, delay, hint)
+        except OpenSkyError as exc:
+            backoff = min(backoff * 2, config.BACKOFF_MAX_SECONDS)
+            delay = backoff
+            logger.warning('OpenSky fetch failed (%s); retrying in %.0fs',
+                           exc, delay)
+        except psycopg2.Error as exc:
+            if conn is not None:
+                try:
+                    conn.close()
+                except psycopg2.Error:
+                    pass
+                conn = None
+            backoff = min(backoff * 2, config.BACKOFF_MAX_SECONDS)
+            delay = backoff
+            logger.error('Database error (%s); reconnecting in %.0fs',
+                         exc, delay)
+
+        runtime.sleep_with_heartbeat(delay)
+
+
+def main() -> None:
+    config.setup_logging()
+    auth_mode = ('OAuth2 client credentials'
+                 if config.OPENSKY_CLIENT_ID and config.OPENSKY_CLIENT_SECRET
+                 else 'anonymous')
+    logger.info(
+        'Starting ingestion: bbox=(%.1f, %.1f)-(%.1f, %.1f), interval=%ds, '
+        'retention=%dh, OpenSky auth=%s',
+        config.BBOX_LAMIN, config.BBOX_LOMIN, config.BBOX_LAMAX,
+        config.BBOX_LOMAX, config.FETCH_INTERVAL_SECONDS,
+        config.RETENTION_HOURS, auth_mode)
+
     try:
-        while True:
-            ingest_cycle()
-            time.sleep(FETCH_INTERVAL)
+        db.wait_for_db()
+        db.apply_migrations()
+    except (RuntimeError, psycopg2.Error, OSError) as exc:
+        logger.critical('Startup failed: %s', exc)
+        sys.exit(1)
+
+    runtime.install_sigterm_handler()
+    try:
+        run_loop()
     except KeyboardInterrupt:
-        print("\n\nIngestion stopped by user")
-    except Exception as e:
-        print(f"\nFatal error: {e}")
-        raise
+        logger.info('Interrupted; shutting down')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-
