@@ -14,4 +14,7 @@ build
 .venv
 venv/
 ENV/
-
+.pytest_cache
+tests/
+demo.png
+README.md

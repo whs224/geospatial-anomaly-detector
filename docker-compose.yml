@@ -1,20 +1,47 @@
-version: '3.8'
+x-app-env: &app-env
+  DB_HOST: db
+  DB_PORT: 5432
+  DB_NAME: ${POSTGRES_DB:-geospatial_db}
+  DB_USER: ${POSTGRES_USER:-postgres}
+  DB_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+  # Tunables shared by the services; each reads only the ones it needs.
+  # Unset variables fall back to the defaults defined in config.py.
+  FETCH_INTERVAL_SECONDS: ${FETCH_INTERVAL_SECONDS:-60}
+  BBOX_LAMIN: ${BBOX_LAMIN:-42.0}
+  BBOX_LOMIN: ${BBOX_LOMIN:--5.0}
+  BBOX_LAMAX: ${BBOX_LAMAX:-54.0}
+  BBOX_LOMAX: ${BBOX_LOMAX:-16.0}
+  VELOCITY_CHANGE_THRESHOLD_MS: ${VELOCITY_CHANGE_THRESHOLD_MS:-30.0}
+  MAX_TIME_GAP_SECONDS: ${MAX_TIME_GAP_SECONDS:-}
+  DETECTION_INTERVAL_SECONDS: ${DETECTION_INTERVAL_SECONDS:-15}
+  ACTIVE_WINDOW_SECONDS: ${ACTIVE_WINDOW_SECONDS:-}
+  ANOMALY_TTL_SECONDS: ${ANOMALY_TTL_SECONDS:-300}
+  RETENTION_HOURS: ${RETENTION_HOURS:-24}
+
+# Loop services touch /tmp/heartbeat every cycle; stale means hung.
+x-loop-healthcheck: &loop-healthcheck
+  test: ["CMD-SHELL", "find /tmp/heartbeat -newermt '-190 seconds' | grep -q ."]
+  interval: 60s
+  timeout: 5s
+  retries: 3
+  start_period: 90s
 
 services:
   db:
     image: postgis/postgis:15-3.3
     container_name: geo-postgres
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: geospatial_db
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-geospatial_db}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -24,59 +51,71 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: geo-ingestor
+    restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
     environment:
-      DB_HOST: db
-      DB_PORT: 5432
-      DB_NAME: geospatial_db
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      <<: *app-env
+      OPENSKY_CLIENT_ID: ${OPENSKY_CLIENT_ID:-}
+      OPENSKY_CLIENT_SECRET: ${OPENSKY_CLIENT_SECRET:-}
     volumes:
       - ./main.py:/app/main.py
-    restart: unless-stopped
+      - ./opensky.py:/app/opensky.py
+      - ./config.py:/app/config.py
+      - ./db.py:/app/db.py
+      - ./runtime.py:/app/runtime.py
+      - ./migrations.sql:/app/migrations.sql
+    healthcheck: *loop-healthcheck
 
   detector:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: geo-detector
+    restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
     environment:
-      DB_HOST: db
-      DB_PORT: 5432
-      DB_NAME: geospatial_db
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      <<: *app-env
     volumes:
       - ./detector.py:/app/detector.py
+      - ./anomaly.py:/app/anomaly.py
+      - ./config.py:/app/config.py
+      - ./db.py:/app/db.py
+      - ./runtime.py:/app/runtime.py
+      - ./migrations.sql:/app/migrations.sql
     command: ["python", "detector.py"]
-    restart: unless-stopped
+    healthcheck: *loop-healthcheck
 
   api:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: geo-api
+    restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
     environment:
-      DB_HOST: db
-      DB_PORT: 5432
-      DB_NAME: geospatial_db
-      DB_USER: postgres
-      DB_PASSWORD: postgres
+      <<: *app-env
     volumes:
       - ./api.py:/app/api.py
-    command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--reload"]
+      - ./anomaly.py:/app/anomaly.py
+      - ./config.py:/app/config.py
+      - ./db.py:/app/db.py
+      - ./migrations.sql:/app/migrations.sql
+      - ./index.html:/app/index.html
+    command: ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
-      - "8000:8000"
-    restart: unless-stopped
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
 volumes:
   postgres_data:
-
