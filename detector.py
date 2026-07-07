@@ -1,181 +1,160 @@
 #!/usr/bin/env python3
-"""
-Real-Time Geospatial Anomaly Detector - Anomaly Detection Script
-Detects erratic velocity changes in flight data
+"""Anomaly detection service.
+
+Every cycle, compares consecutive observations per aircraft inside a recent
+window. A velocity change above the threshold between two observations close
+enough in time to be comparable is persisted to anomaly_events with its full
+kinematic evidence; the unique key makes re-detection across cycles a no-op.
 """
 
-import os
-import time
+import logging
+import sys
+from typing import Any, Dict, List
+
 import psycopg2
-from datetime import datetime
-from typing import List, Tuple, Optional
+from psycopg2.extras import execute_values
 
-# Database connection parameters
-DB_HOST = os.getenv('DB_HOST', 'localhost')
-DB_PORT = os.getenv('DB_PORT', '5432')
-DB_NAME = os.getenv('DB_NAME', 'geospatial_db')
-DB_USER = os.getenv('DB_USER', 'postgres')
-DB_PASSWORD = os.getenv('DB_PASSWORD', 'postgres')
+import config
+import db
+import runtime
+from anomaly import build_anomaly_records, format_summary
 
-# Detection parameters
-VELOCITY_CHANGE_THRESHOLD = 30.0  # m/s
-DETECTION_INTERVAL = 10  # seconds
+logger = logging.getLogger('detector')
 
+# Consecutive-observation pairs whose velocity delta exceeds the threshold.
+# The max-gap predicate keeps unrelated observations (an aircraft leaving the
+# bounding box and returning much later) from being compared.
+CANDIDATE_QUERY = """
+    WITH recent AS (
+        SELECT icao24, callsign, velocity, last_contact
+        FROM flight_positions
+        WHERE last_contact >= now() - make_interval(secs => %(lookback)s)
+          AND velocity IS NOT NULL
+    ),
+    pairs AS (
+        SELECT
+            icao24,
+            callsign,
+            velocity AS new_velocity,
+            last_contact,
+            LAG(velocity) OVER w AS prev_velocity,
+            LAG(last_contact) OVER w AS prev_contact
+        FROM recent
+        WINDOW w AS (PARTITION BY icao24 ORDER BY last_contact)
+    )
+    SELECT
+        icao24,
+        callsign,
+        prev_velocity,
+        new_velocity,
+        prev_contact,
+        last_contact,
+        EXTRACT(EPOCH FROM (last_contact - prev_contact)) AS time_gap_seconds
+    FROM pairs
+    WHERE prev_velocity IS NOT NULL
+      AND ABS(new_velocity - prev_velocity) > %(threshold)s
+      AND last_contact - prev_contact <= make_interval(secs => %(max_gap)s)
+    ORDER BY icao24, last_contact
+"""
 
-def get_db_connection() -> psycopg2.extensions.connection:
-    """Establish connection to PostgreSQL database."""
-    try:
-        conn = psycopg2.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD
-        )
-        return conn
-    except psycopg2.Error as e:
-        print(f"Error connecting to database: {e}")
-        raise
-
-
-def detect_velocity_anomalies(conn: psycopg2.extensions.connection) -> List[Tuple[str, str, float]]:
-    """
-    Detect flights with erratic velocity changes (> 30 m/s) between their two most recent updates.
-    
-    Uses LAG() window function to compare current velocity with previous velocity for each flight.
-    
-    Returns:
-        List of tuples: (icao24, callsign, velocity_delta)
-    """
-    cursor = conn.cursor()
-    anomalies = []
-    
-    try:
-        # Query to find velocity anomalies using LAG() window function
-        query = """
-            WITH velocity_changes AS (
-                SELECT 
-                    icao24,
-                    callsign,
-                    velocity,
-                    last_contact,
-                    LAG(velocity) OVER (
-                        PARTITION BY icao24 
-                        ORDER BY last_contact
-                    ) AS previous_velocity,
-                    ABS(velocity - LAG(velocity) OVER (
-                        PARTITION BY icao24 
-                        ORDER BY last_contact
-                    )) AS velocity_delta
-                FROM flight_positions
-                WHERE velocity IS NOT NULL
-            ),
-            latest_positions AS (
-                SELECT 
-                    icao24,
-                    callsign,
-                    velocity_delta,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY icao24 
-                        ORDER BY last_contact DESC
-                    ) AS rn
-                FROM velocity_changes
-                WHERE previous_velocity IS NOT NULL
-                    AND velocity_delta > %s
-            )
-            SELECT 
-                icao24,
-                COALESCE(callsign, 'UNKNOWN') AS callsign,
-                velocity_delta
-            FROM latest_positions
-            WHERE rn = 1
-            ORDER BY velocity_delta DESC;
-        """
-        
-        cursor.execute(query, (VELOCITY_CHANGE_THRESHOLD,))
-        results = cursor.fetchall()
-        
-        for row in results:
-            icao24, callsign, delta = row
-            anomalies.append((icao24, callsign, float(delta)))
-        
-    except psycopg2.Error as e:
-        print(f"Database error during anomaly detection: {e}")
-    finally:
-        cursor.close()
-    
-    return anomalies
+INSERT_QUERY = """
+    INSERT INTO anomaly_events
+        (icao24, callsign, prev_velocity, new_velocity, delta_v,
+         time_gap_seconds, implied_accel, threshold, prev_contact,
+         last_contact)
+    VALUES %s
+    ON CONFLICT (icao24, last_contact) DO NOTHING
+    RETURNING icao24, last_contact
+"""
 
 
-def detection_cycle():
-    """Single cycle of anomaly detection."""
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"\n[{timestamp}] Running anomaly detection...")
-    
-    try:
-        conn = get_db_connection()
-        anomalies = detect_velocity_anomalies(conn)
-        conn.close()
-        
-        if anomalies:
-            print(f"Found {len(anomalies)} anomaly/anomalies:")
-            for icao24, callsign, delta in anomalies:
-                print(f"[ANOMALY DETECTED] Flight {callsign} changed speed by {delta:.2f} m/s")
-        else:
-            print("No anomalies detected")
-            
-    except Exception as e:
-        print(f"Error in detection cycle: {e}")
+def fetch_candidates(conn: psycopg2.extensions.connection) -> List[tuple]:
+    with conn.cursor() as cursor:
+        cursor.execute(CANDIDATE_QUERY, {
+            'lookback': config.DETECTION_LOOKBACK_SECONDS,
+            'threshold': config.VELOCITY_CHANGE_THRESHOLD_MS,
+            'max_gap': config.MAX_TIME_GAP_SECONDS,
+        })
+        return cursor.fetchall()
 
 
-def main():
-    """Main loop that runs anomaly detection every 10 seconds."""
-    print("=" * 60)
-    print("Real-Time Geospatial Anomaly Detector - Detection Service")
-    print("=" * 60)
-    print(f"Database: {DB_HOST}:{DB_PORT}/{DB_NAME}")
-    print(f"Detection interval: {DETECTION_INTERVAL} seconds")
-    print(f"Velocity change threshold: {VELOCITY_CHANGE_THRESHOLD} m/s")
-    print("=" * 60)
-    
-    # Wait for database to be ready
-    print("Waiting for database connection...")
-    max_retries = 30
-    retry_count = 0
-    
-    while retry_count < max_retries:
+def persist_anomalies(conn: psycopg2.extensions.connection,
+                      records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Insert evidence records; returns only the ones that were new."""
+    if not records:
+        return []
+    rows = [
+        (r['icao24'], r['callsign'], r['prev_velocity'], r['new_velocity'],
+         r['delta_v'], r['time_gap_seconds'], r['implied_accel'],
+         r['threshold'], r['prev_contact'], r['last_contact'])
+        for r in records
+    ]
+    with conn.cursor() as cursor:
+        returned = execute_values(
+            cursor, INSERT_QUERY, rows, page_size=200, fetch=True)
+    new_keys = set(returned)
+    return [r for r in records
+            if (r['icao24'], r['last_contact']) in new_keys]
+
+
+def detection_cycle(conn: psycopg2.extensions.connection) -> None:
+    candidates = fetch_candidates(conn)
+    records = build_anomaly_records(
+        candidates, config.VELOCITY_CHANGE_THRESHOLD_MS)
+    new_records = persist_anomalies(conn, records)
+    # Commit even on read-only cycles: an open transaction would freeze
+    # now() in the candidate query and leave the session idle-in-transaction.
+    conn.commit()
+    for record in new_records:
+        logger.warning(
+            '[ANOMALY] %s (%s): %s',
+            record['callsign'] or 'UNKNOWN', record['icao24'],
+            format_summary(record))
+    if not new_records:
+        logger.info('No new anomalies (%d candidate pairs re-checked)',
+                    len(records))
+
+
+def run_loop() -> None:
+    conn = None
+    while True:
+        runtime.heartbeat()
         try:
-            conn = get_db_connection()
-            conn.close()
-            print("Database connection established!")
-            break
-        except psycopg2.Error:
-            retry_count += 1
-            print(f"Retrying database connection ({retry_count}/{max_retries})...")
-            time.sleep(2)
-    else:
-        print("Failed to connect to database after maximum retries")
-        return
-    
-    # Wait a bit for initial data to be ingested
-    print("\nWaiting for initial data ingestion...")
-    time.sleep(15)
-    
-    # Main detection loop
-    print(f"\nStarting detection loop (every {DETECTION_INTERVAL} seconds)...")
-    print("Press Ctrl+C to stop\n")
-    
+            if conn is None or conn.closed:
+                conn = db.connect()
+            detection_cycle(conn)
+        except psycopg2.Error as exc:
+            if conn is not None:
+                try:
+                    conn.close()
+                except psycopg2.Error:
+                    pass
+                conn = None
+            logger.error('Database error (%s); reconnecting next cycle', exc)
+        runtime.sleep_with_heartbeat(config.DETECTION_INTERVAL_SECONDS)
+
+
+def main() -> None:
+    config.setup_logging()
+    logger.info(
+        'Starting detection: threshold=%.1f m/s, max gap=%.0fs, '
+        'lookback=%.0fs, interval=%ds',
+        config.VELOCITY_CHANGE_THRESHOLD_MS, config.MAX_TIME_GAP_SECONDS,
+        config.DETECTION_LOOKBACK_SECONDS, config.DETECTION_INTERVAL_SECONDS)
+
     try:
-        while True:
-            detection_cycle()
-            time.sleep(DETECTION_INTERVAL)
+        db.wait_for_db()
+        db.apply_migrations()
+    except (RuntimeError, psycopg2.Error, OSError) as exc:
+        logger.critical('Startup failed: %s', exc)
+        sys.exit(1)
+
+    runtime.install_sigterm_handler()
+    try:
+        run_loop()
     except KeyboardInterrupt:
-        print("\n\nDetection stopped by user")
-    except Exception as e:
-        print(f"\nFatal error: {e}")
-        raise
+        logger.info('Interrupted; shutting down')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
-
