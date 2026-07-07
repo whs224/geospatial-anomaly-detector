@@ -1,6 +1,6 @@
 # Real-Time Geospatial Anomaly Detector
 
-A distributed intelligence pipeline that ingests live flight telemetry over mainland Europe, detects kinematic anomalies in real time, and visualizes high-priority targets — with the evidence behind every alert — for operator review.
+A distributed intelligence pipeline that ingests live flight telemetry over Switzerland, detects kinematic anomalies in real time, and visualizes high-priority targets — with the evidence behind every alert — for operator review.
 
 ## 🎯 Project Goal
 To move beyond static data analysis and build a **living system** that can:
@@ -12,7 +12,7 @@ To move beyond static data analysis and build a **living system** that can:
 ## 🏗 System Architecture
 The system follows a microservices architecture, fully containerized with Docker:
 
-* **Ingestor Service (Python):** Polls OpenSky `/states/all` for the configured bounding box (default: France, Germany, Switzerland, northern Italy, Benelux). Handles rate limiting with exponential backoff and `Retry-After`, supports optional OAuth2 client credentials, filters out on-ground traffic and null coordinates, batch-inserts idempotently (`execute_values` + `ON CONFLICT DO NOTHING`), and prunes history past the retention window.
+* **Ingestor Service (Python):** Polls OpenSky `/states/all` for the configured bounding box (default: Switzerland). Handles rate limiting with exponential backoff and `Retry-After`, supports optional OAuth2 client credentials, filters out on-ground traffic and null coordinates, batch-inserts idempotently (`execute_values` + `ON CONFLICT DO NOTHING`), and prunes history past the retention window.
 * **Persistence Layer (PostgreSQL + PostGIS):** Positions stored as SRID-4326 geometry with a composite `(icao24, last_contact)` unique index backing every window query. Schema is managed by idempotent migrations that each service applies at startup under an advisory lock — no manual migration step, no drift between fresh and long-running databases.
 * **Intelligence/Detector (Python):** A decoupled worker that compares consecutive observations per aircraft inside a sliding window. A velocity change above the threshold — between observations close enough in time to be comparable — is persisted to `anomaly_events` with the full evidence: speed before/after, delta, time gap, and implied acceleration in m/s². Detection stays isolated from ingestion, so a slow query never blocks data capture.
 * **API & Frontend (FastAPI + Leaflet):** The API serves the map itself at `/` and a GeoJSON feed at `/flights` that joins latest positions with recent anomaly evidence. The UI prioritizes **alert hierarchy** — normal traffic is blue/static, anomalies are red/pulsing — and every anomaly popup explains the detection in one line, e.g. *"Speed jumped 63.7 m/s in 10s (6.4 m/s² implied), exceeding the 30 m/s threshold"*. The newest anomaly's popup opens automatically.
@@ -29,7 +29,7 @@ Prerequisites: Docker & Docker Compose.
     ```bash
     cp .env.example .env
     ```
-    Everything runs with defaults, but OpenSky's anonymous tier only grants ~400 API credits/day (the default bounding box costs 3 credits per request). A free OpenSky account gets 4,000/day — create an API client under *Account → API Client* and put the credentials in `.env`.
+    Everything runs with defaults, but OpenSky's anonymous tier only grants ~400 API credits/day (the default Switzerland bounding box costs 1 credit per request). A free OpenSky account gets 4,000/day — create an API client under *Account → API Client* and put the credentials in `.env`.
 3.  **Start the pipeline:**
     ```bash
     docker compose up --build -d

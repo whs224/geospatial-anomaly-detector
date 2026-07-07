@@ -53,14 +53,14 @@ OPENSKY_CLIENT_ID = _env_str('OPENSKY_CLIENT_ID', '')
 OPENSKY_CLIENT_SECRET = _env_str('OPENSKY_CLIENT_SECRET', '')
 
 # --- Ingestion ---------------------------------------------------------------
-# Mainland Europe bounding box: France, Germany, Switzerland, northern Italy,
-# Benelux. At 252 square degrees each /states/all request costs 3 API credits.
-BBOX_LAMIN = _env_float('BBOX_LAMIN', 42.0)
-BBOX_LOMIN = _env_float('BBOX_LOMIN', -5.0)
-BBOX_LAMAX = _env_float('BBOX_LAMAX', 54.0)
-BBOX_LOMAX = _env_float('BBOX_LOMAX', 16.0)
+# Switzerland bounding box (~9 square degrees). At this size each /states/all
+# request costs 1 API credit, so the fast fetch cadence stays cheap.
+BBOX_LAMIN = _env_float('BBOX_LAMIN', 45.8)
+BBOX_LOMIN = _env_float('BBOX_LOMIN', 5.9)
+BBOX_LAMAX = _env_float('BBOX_LAMAX', 47.8)
+BBOX_LOMAX = _env_float('BBOX_LOMAX', 10.5)
 
-FETCH_INTERVAL_SECONDS = _env_int('FETCH_INTERVAL_SECONDS', 60)
+FETCH_INTERVAL_SECONDS = _env_int('FETCH_INTERVAL_SECONDS', 10)
 # Cap for exponential backoff after failed or rate-limited fetches.
 BACKOFF_MAX_SECONDS = _env_int('BACKOFF_MAX_SECONDS', 900)
 
@@ -71,7 +71,7 @@ PRUNE_INTERVAL_SECONDS = _env_int('PRUNE_INTERVAL_SECONDS', 3600)
 
 # --- Detection ---------------------------------------------------------------
 VELOCITY_CHANGE_THRESHOLD_MS = _env_float('VELOCITY_CHANGE_THRESHOLD_MS', 30.0)
-DETECTION_INTERVAL_SECONDS = _env_int('DETECTION_INTERVAL_SECONDS', 15)
+DETECTION_INTERVAL_SECONDS = _env_int('DETECTION_INTERVAL_SECONDS', 10)
 # Observation pairs further apart than this are not comparable: an aircraft
 # that left the bounding box and returned later would otherwise produce a
 # false positive from two unrelated cruise segments.
