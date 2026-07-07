@@ -1,213 +1,187 @@
 #!/usr/bin/env python3
-"""
-FastAPI server for Real-Time Geospatial Anomaly Detector
-Provides GeoJSON endpoint for flight visualization
+"""API service.
+
+Serves the Leaflet map at / and a GeoJSON feed of latest flight positions at
+/flights, annotated with the anomaly evidence the detector persisted.
 """
 
-import os
+import logging
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Dict
+
 import psycopg2
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict, Any
-from datetime import datetime, timedelta
+from fastapi.responses import FileResponse
 
-# Database connection parameters
-DB_HOST = os.getenv('DB_HOST', 'localhost')
-DB_PORT = os.getenv('DB_PORT', '5432')
-DB_NAME = os.getenv('DB_NAME', 'geospatial_db')
-DB_USER = os.getenv('DB_USER', 'postgres')
-DB_PASSWORD = os.getenv('DB_PASSWORD', 'postgres')
+import config
+import db
+from anomaly import format_summary
 
-# Anomaly detection threshold
-VELOCITY_CHANGE_THRESHOLD = 30.0  # m/s
+config.setup_logging()
+logger = logging.getLogger('api')
 
-app = FastAPI(title="Geospatial Anomaly Detector API")
+INDEX_PATH = Path(__file__).resolve().parent / 'index.html'
 
-# Enable CORS for local HTML file
+# Latest position per currently-active aircraft. The recency filter keeps the
+# scan bounded and stops long-departed aircraft from rendering forever.
+LATEST_POSITIONS_QUERY = """
+    SELECT DISTINCT ON (icao24)
+        icao24,
+        callsign,
+        velocity,
+        heading,
+        last_contact,
+        ST_X(geom) AS longitude,
+        ST_Y(geom) AS latitude
+    FROM flight_positions
+    WHERE last_contact >= now() - make_interval(secs => %(active_window)s)
+    ORDER BY icao24, last_contact DESC
+"""
+
+# Most recent anomaly event per aircraft inside the display window.
+RECENT_ANOMALIES_QUERY = """
+    SELECT DISTINCT ON (icao24)
+        icao24,
+        callsign,
+        prev_velocity,
+        new_velocity,
+        delta_v,
+        time_gap_seconds,
+        implied_accel,
+        threshold,
+        detected_at
+    FROM anomaly_events
+    WHERE detected_at >= now() - make_interval(secs => %(ttl)s)
+    -- last_contact breaks ties: a detector batch inserts every event of a
+    -- cycle with the same detected_at, so order by the observation time too.
+    ORDER BY icao24, detected_at DESC, last_contact DESC
+"""
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Apply migrations here too (under the shared advisory lock) so the API
+    # never races the loop services and can serve against a fresh database on
+    # its own.
+    db.wait_for_db()
+    db.apply_migrations()
+    app.state.pool = db.create_pool(minconn=1, maxconn=5)
+    logger.info('Connection pool ready')
+    yield
+    app.state.pool.closeall()
+
+
+app = FastAPI(title='Geospatial Anomaly Detector API', lifespan=lifespan)
+
+# The map is served same-origin; the permissive read-only policy just keeps
+# an index.html opened straight from disk working too.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins for local development
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=['*'],
+    allow_credentials=False,
+    allow_methods=['GET'],
+    allow_headers=['*'],
 )
 
 
-def get_db_connection() -> psycopg2.extensions.connection:
-    """Establish connection to PostgreSQL database."""
-    try:
-        conn = psycopg2.connect(
-            host=DB_HOST,
-            port=DB_PORT,
-            database=DB_NAME,
-            user=DB_USER,
-            password=DB_PASSWORD
-        )
-        return conn
-    except psycopg2.Error as e:
-        raise HTTPException(status_code=500, detail=f"Database connection error: {e}")
+def _anomaly_payload(row: tuple) -> Dict[str, Any]:
+    (_icao24, _callsign, prev_velocity, new_velocity, delta_v,
+     time_gap_seconds, implied_accel, threshold, detected_at) = row
+    record = {
+        'prev_velocity': prev_velocity,
+        'new_velocity': new_velocity,
+        'delta_v': delta_v,
+        'time_gap_seconds': time_gap_seconds,
+        'implied_accel': implied_accel,
+        'threshold': threshold,
+    }
+    return {
+        **record,
+        'detected_at': detected_at.isoformat(),
+        'summary': format_summary(record),
+    }
 
 
-def get_anomalous_flights(conn: psycopg2.extensions.connection) -> set:
+@app.get('/flights')
+def get_flights(request: Request) -> Dict[str, Any]:
+    """Latest position of active flights as a GeoJSON FeatureCollection.
+
+    Flights with a recent anomaly event carry `is_anomaly: true` plus the
+    full evidence payload under `anomaly`.
     """
-    Get set of icao24 values for flights with anomalies in the last minute.
-    Re-runs the anomaly detection logic.
-    
-    Returns:
-        Set of icao24 strings that are anomalous
-    """
-    cursor = conn.cursor()
-    anomalous_icao24s = set()
-    
+    pool = request.app.state.pool
     try:
-        # Query to find velocity anomalies in the last minute
-        query = """
-            WITH recent_positions AS (
-                SELECT *
-                FROM flight_positions
-                WHERE last_contact >= NOW() - INTERVAL '1 minute'
-                    AND velocity IS NOT NULL
-            ),
-            velocity_changes AS (
-                SELECT 
-                    icao24,
-                    callsign,
-                    velocity,
-                    last_contact,
-                    LAG(velocity) OVER (
-                        PARTITION BY icao24 
-                        ORDER BY last_contact
-                    ) AS previous_velocity,
-                    ABS(velocity - LAG(velocity) OVER (
-                        PARTITION BY icao24 
-                        ORDER BY last_contact
-                    )) AS velocity_delta
-                FROM recent_positions
-            ),
-            latest_positions AS (
-                SELECT 
-                    icao24,
-                    callsign,
-                    velocity_delta,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY icao24 
-                        ORDER BY last_contact DESC
-                    ) AS rn
-                FROM velocity_changes
-                WHERE previous_velocity IS NOT NULL
-                    AND velocity_delta > %s
-            )
-            SELECT DISTINCT icao24
-            FROM latest_positions
-            WHERE rn = 1;
-        """
-        
-        cursor.execute(query, (VELOCITY_CHANGE_THRESHOLD,))
-        results = cursor.fetchall()
-        
-        for row in results:
-            anomalous_icao24s.add(row[0])
-        
-    except psycopg2.Error as e:
-        print(f"Error detecting anomalies: {e}")
+        conn = pool.getconn()
+    except psycopg2.Error as exc:
+        logger.error('Could not get database connection: %s', exc)
+        raise HTTPException(status_code=503, detail='database unavailable')
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(RECENT_ANOMALIES_QUERY,
+                           {'ttl': config.ANOMALY_TTL_SECONDS})
+            anomalies = {row[0]: row for row in cursor.fetchall()}
+            cursor.execute(LATEST_POSITIONS_QUERY,
+                           {'active_window': config.ACTIVE_WINDOW_SECONDS})
+            rows = cursor.fetchall()
+        conn.commit()
+    except psycopg2.Error as exc:
+        try:
+            conn.rollback()
+        except psycopg2.Error:
+            pass
+        logger.exception('Database error serving /flights')
+        raise HTTPException(status_code=500, detail='database error') from exc
     finally:
-        cursor.close()
-    
-    return anomalous_icao24s
+        pool.putconn(conn)
 
-
-@app.get("/flights")
-async def get_flights() -> Dict[str, Any]:
-    """
-    Get latest position of all flights as GeoJSON FeatureCollection.
-    Flags flights with anomalies in the last minute.
-    """
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Get anomalous flights
-        anomalous_flights = get_anomalous_flights(conn)
-        
-        # Get latest position for each flight
-        query = """
-            WITH latest_positions AS (
-                SELECT 
-                    icao24,
-                    callsign,
-                    velocity,
-                    heading,
-                    last_contact,
-                    ST_X(geom) AS longitude,
-                    ST_Y(geom) AS latitude,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY icao24 
-                        ORDER BY last_contact DESC
-                    ) AS rn
-                FROM flight_positions
-                WHERE geom IS NOT NULL
-            )
-            SELECT 
-                icao24,
-                COALESCE(callsign, 'UNKNOWN') AS callsign,
-                velocity,
-                heading,
-                last_contact,
-                longitude,
-                latitude
-            FROM latest_positions
-            WHERE rn = 1
-            ORDER BY last_contact DESC;
-        """
-        
-        cursor.execute(query)
-        rows = cursor.fetchall()
-        
-        # Build GeoJSON FeatureCollection
-        features = []
-        for row in rows:
-            icao24, callsign, velocity, heading, last_contact, lon, lat = row
-            
-            # Check if this flight is anomalous
-            is_anomaly = icao24 in anomalous_flights
-            
-            feature = {
-                "type": "Feature",
-                "geometry": {
-                    "type": "Point",
-                    "coordinates": [lon, lat]
-                },
-                "properties": {
-                    "icao24": icao24,
-                    "callsign": callsign or "UNKNOWN",
-                    "velocity": velocity,
-                    "heading": heading,
-                    "last_contact": last_contact.isoformat() if last_contact else None,
-                    "is_anomaly": is_anomaly
-                }
-            }
-            features.append(feature)
-        
-        geojson = {
-            "type": "FeatureCollection",
-            "features": features
+    features = []
+    for icao24, callsign, velocity, heading, last_contact, lon, lat in rows:
+        properties: Dict[str, Any] = {
+            'icao24': icao24,
+            'callsign': callsign or 'UNKNOWN',
+            'velocity': velocity,
+            'heading': heading,
+            'last_contact': last_contact.isoformat(),
+            'is_anomaly': icao24 in anomalies,
         }
-        
-        cursor.close()
-        return geojson
-        
-    except psycopg2.Error as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
+        if icao24 in anomalies:
+            properties['anomaly'] = _anomaly_payload(anomalies[icao24])
+        features.append({
+            'type': 'Feature',
+            'geometry': {'type': 'Point', 'coordinates': [lon, lat]},
+            'properties': properties,
+        })
+
+    return {'type': 'FeatureCollection', 'features': features}
+
+
+@app.get('/health')
+def health(request: Request) -> Dict[str, str]:
+    """Liveness check for the service and its database connectivity."""
+    pool = request.app.state.pool
+    try:
+        conn = pool.getconn()
+    except psycopg2.Error:
+        raise HTTPException(status_code=503, detail='database unavailable')
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT 1')
+            cursor.fetchone()
+        conn.commit()
+    except psycopg2.Error:
+        try:
+            conn.rollback()
+        except psycopg2.Error:
+            pass
+        raise HTTPException(status_code=503, detail='database unavailable')
     finally:
-        if conn:
-            conn.close()
+        pool.putconn(conn)
+    return {'status': 'ok', 'service': 'Geospatial Anomaly Detector API'}
 
 
-@app.get("/")
-async def root():
-    """Health check endpoint."""
-    return {"status": "ok", "service": "Geospatial Anomaly Detector API"}
-
+@app.get('/', include_in_schema=False)
+def root() -> FileResponse:
+    return FileResponse(INDEX_PATH, media_type='text/html')
