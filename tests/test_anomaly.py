@@ -15,7 +15,7 @@ def make_row(prev_v=168.3, new_v=232.0, gap=10.0):
 
 
 def test_builds_record_with_implied_acceleration():
-    records = build_anomaly_records([make_row()], threshold=30.0)
+    records = build_anomaly_records([make_row()], threshold=2.0)
     assert len(records) == 1
     record = records[0]
     assert record['icao24'] == '4b1814'
@@ -24,7 +24,7 @@ def test_builds_record_with_implied_acceleration():
     assert record['delta_v'] == 63.7
     assert record['time_gap_seconds'] == 10.0
     assert record['implied_accel'] == 6.37
-    assert record['threshold'] == 30.0
+    assert record['threshold'] == 2.0
     # Keys the detector persists / dedupes on — a refactor dropping any of
     # these would break insertion, so pin them here.
     assert record['callsign'] == 'SWR123'
@@ -35,14 +35,14 @@ def test_builds_record_with_implied_acceleration():
 def test_decimal_gap_from_sql_is_handled():
     # EXTRACT(EPOCH ...) comes back from PostgreSQL as Decimal.
     records = build_anomaly_records(
-        [make_row(gap=Decimal('10.0'))], threshold=30.0)
+        [make_row(gap=Decimal('10.0'))], threshold=2.0)
     assert records[0]['implied_accel'] == 6.37
 
 
 def test_zero_or_negative_gap_skipped():
-    assert build_anomaly_records([make_row(gap=0)], 30.0) == []
-    assert build_anomaly_records([make_row(gap=-5)], 30.0) == []
-    assert build_anomaly_records([make_row(gap=None)], 30.0) == []
+    assert build_anomaly_records([make_row(gap=0)], 2.0) == []
+    assert build_anomaly_records([make_row(gap=-5)], 2.0) == []
+    assert build_anomaly_records([make_row(gap=None)], 2.0) == []
 
 
 def test_mixed_batch_skips_invalid_and_preserves_order():
@@ -53,29 +53,34 @@ def test_mixed_batch_skips_invalid_and_preserves_order():
         make_row(gap=0),                        # invalid gap, skipped
         make_row(prev_v=232.0, new_v=168.3),    # valid, delta 63.7
     ]
-    records = build_anomaly_records(rows, threshold=30.0)
+    records = build_anomaly_records(rows, threshold=2.0)
     assert [r['delta_v'] for r in records] == [70.0, 63.7]
 
 
 def test_threshold_is_recorded_not_filtered():
     # build_anomaly_records does not gate on the threshold — the SQL candidate
-    # query does. A sub-threshold row still yields a record carrying the
-    # threshold for the explanation string.
+    # query does. A sub-threshold row (implied accel 1.0 < 2.0) still yields a
+    # record carrying the threshold for the explanation string.
     records = build_anomaly_records(
-        [make_row(prev_v=100.0, new_v=110.0)], threshold=30.0)
+        [make_row(prev_v=100.0, new_v=110.0)], threshold=2.0)
     assert len(records) == 1
     assert records[0]['delta_v'] == 10.0
-    assert records[0]['threshold'] == 30.0
+    assert records[0]['implied_accel'] == 1.0
+    assert records[0]['threshold'] == 2.0
 
 
-def test_summary_wording_for_speed_increase():
-    records = build_anomaly_records([make_row()], threshold=30.0)
+def test_summary_describes_implied_acceleration():
+    records = build_anomaly_records([make_row()], threshold=2.0)
     assert format_summary(records[0]) == (
-        'Speed jumped 63.7 m/s in 10s (6.4 m/s² implied), '
-        'exceeding the 30 m/s threshold')
+        'Implied acceleration 6.4 m/s² over 10s exceeds the '
+        '2.0 m/s² threshold')
 
 
-def test_summary_wording_for_speed_decrease():
+def test_summary_wording_is_direction_agnostic():
+    # A speed decrease reads the same as an increase: detection is about the
+    # magnitude of the implied acceleration, not its sign.
     records = build_anomaly_records(
-        [make_row(prev_v=232.0, new_v=168.3)], threshold=30.0)
-    assert format_summary(records[0]).startswith('Speed dropped 63.7 m/s')
+        [make_row(prev_v=232.0, new_v=168.3)], threshold=2.0)
+    assert format_summary(records[0]) == (
+        'Implied acceleration 6.4 m/s² over 10s exceeds the '
+        '2.0 m/s² threshold')

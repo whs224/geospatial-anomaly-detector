@@ -43,10 +43,7 @@ def build_anomaly_records(rows: Sequence[Sequence[Any]],
 
 def format_summary(record: Dict[str, Any]) -> str:
     """One-line human-readable explanation of an anomaly event."""
-    verb = ('jumped' if record['new_velocity'] >= record['prev_velocity']
-            else 'dropped')
     return (
-        f"Speed {verb} {record['delta_v']:.1f} m/s in "
-        f"{record['time_gap_seconds']:.0f}s "
-        f"({record['implied_accel']:.1f} m/s² implied), "
-        f"exceeding the {record['threshold']:.0f} m/s threshold")
+        f"Implied acceleration {record['implied_accel']:.1f} m/s² over "
+        f"{record['time_gap_seconds']:.0f}s exceeds the "
+        f"{record['threshold']:.1f} m/s² threshold")

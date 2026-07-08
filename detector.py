@@ -2,9 +2,10 @@
 """Anomaly detection service.
 
 Every cycle, compares consecutive observations per aircraft inside a recent
-window. A velocity change above the threshold between two observations close
-enough in time to be comparable is persisted to anomaly_events with its full
-kinematic evidence; the unique key makes re-detection across cycles a no-op.
+window. An implied acceleration (velocity change over the time gap) above the
+threshold, between two observations close enough in time to be comparable, is
+persisted to anomaly_events with its full kinematic evidence; the unique key
+makes re-detection across cycles a no-op.
 """
 
 import logging
@@ -21,9 +22,10 @@ from anomaly import build_anomaly_records, format_summary
 
 logger = logging.getLogger('detector')
 
-# Consecutive-observation pairs whose velocity delta exceeds the threshold.
-# The max-gap predicate keeps unrelated observations (an aircraft leaving the
-# bounding box and returning much later) from being compared.
+# Consecutive-observation pairs whose implied acceleration (velocity delta over
+# the time gap) exceeds the threshold. The max-gap predicate keeps unrelated
+# observations (an aircraft leaving the bounding box and returning much later)
+# from being compared.
 CANDIDATE_QUERY = """
     WITH recent AS (
         SELECT icao24, callsign, velocity, last_contact
@@ -52,8 +54,11 @@ CANDIDATE_QUERY = """
         EXTRACT(EPOCH FROM (last_contact - prev_contact)) AS time_gap_seconds
     FROM pairs
     WHERE prev_velocity IS NOT NULL
-      AND ABS(new_velocity - prev_velocity) > %(threshold)s
+      AND last_contact > prev_contact
       AND last_contact - prev_contact <= make_interval(secs => %(max_gap)s)
+      AND ABS(new_velocity - prev_velocity)
+          / EXTRACT(EPOCH FROM (last_contact - prev_contact))
+          > %(accel_threshold)s
     ORDER BY icao24, last_contact
 """
 
@@ -72,7 +77,7 @@ def fetch_candidates(conn: psycopg2.extensions.connection) -> List[tuple]:
     with conn.cursor() as cursor:
         cursor.execute(CANDIDATE_QUERY, {
             'lookback': config.DETECTION_LOOKBACK_SECONDS,
-            'threshold': config.VELOCITY_CHANGE_THRESHOLD_MS,
+            'accel_threshold': config.ACCEL_THRESHOLD_MS2,
             'max_gap': config.MAX_TIME_GAP_SECONDS,
         })
         return cursor.fetchall()
@@ -100,7 +105,7 @@ def persist_anomalies(conn: psycopg2.extensions.connection,
 def detection_cycle(conn: psycopg2.extensions.connection) -> None:
     candidates = fetch_candidates(conn)
     records = build_anomaly_records(
-        candidates, config.VELOCITY_CHANGE_THRESHOLD_MS)
+        candidates, config.ACCEL_THRESHOLD_MS2)
     new_records = persist_anomalies(conn, records)
     # Commit even on read-only cycles: an open transaction would freeze
     # now() in the candidate query and leave the session idle-in-transaction.
@@ -137,9 +142,9 @@ def run_loop() -> None:
 def main() -> None:
     config.setup_logging()
     logger.info(
-        'Starting detection: threshold=%.1f m/s, max gap=%.0fs, '
+        'Starting detection: accel threshold=%.1f m/s², max gap=%.0fs, '
         'lookback=%.0fs, interval=%ds',
-        config.VELOCITY_CHANGE_THRESHOLD_MS, config.MAX_TIME_GAP_SECONDS,
+        config.ACCEL_THRESHOLD_MS2, config.MAX_TIME_GAP_SECONDS,
         config.DETECTION_LOOKBACK_SECONDS, config.DETECTION_INTERVAL_SECONDS)
 
     try:

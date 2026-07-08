@@ -72,7 +72,10 @@ RETENTION_HOURS = _env_int('RETENTION_HOURS', 24)
 PRUNE_INTERVAL_SECONDS = _env_int('PRUNE_INTERVAL_SECONDS', 3600)
 
 # --- Detection ---------------------------------------------------------------
-VELOCITY_CHANGE_THRESHOLD_MS = _env_float('VELOCITY_CHANGE_THRESHOLD_MS', 30.0)
+# A pair is anomalous when its implied acceleration (delta-v over the time gap)
+# exceeds this threshold, so routine enroute speed changes spread over several
+# seconds no longer fire — only physically abrupt changes do.
+ACCEL_THRESHOLD_MS2 = _env_float('ACCEL_THRESHOLD_MS2', 2.0)
 DETECTION_INTERVAL_SECONDS = _env_int('DETECTION_INTERVAL_SECONDS', 10)
 # Observation pairs further apart than this are not comparable: an aircraft
 # that left the bounding box and returned later would otherwise produce a

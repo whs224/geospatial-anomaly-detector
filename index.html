@@ -209,7 +209,7 @@
                 body.appendChild(popupRow('Δv', anomaly.delta_v.toFixed(1) + ' m/s in '
                     + Math.round(anomaly.time_gap_seconds) + 's'));
                 body.appendChild(popupRow('Implied accel', anomaly.implied_accel.toFixed(1) + ' m/s²'));
-                body.appendChild(popupRow('Threshold', anomaly.threshold.toFixed(0) + ' m/s'));
+                body.appendChild(popupRow('Threshold', anomaly.threshold.toFixed(1) + ' m/s²'));
                 body.appendChild(popupRow('Detected',
                     new Date(anomaly.detected_at).toLocaleTimeString()));
                 const summary = document.createElement('div');
