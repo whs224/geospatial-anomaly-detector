@@ -84,3 +84,30 @@ CREATE TABLE IF NOT EXISTS anomaly_events (
 
 CREATE INDEX IF NOT EXISTS idx_anomaly_events_detected_at
     ON anomaly_events (detected_at);
+
+-- Airspace sectors: approximate TRACON/approach polygons over the coverage
+-- area. The API classifies each aircraft into a sector with a GiST-indexed
+-- ST_Contains spatial join, so the stored position geometry earns its keep
+-- beyond storage. These are real polygons (octagonal approximations of each
+-- terminal area's controlled airspace), not bounding boxes.
+CREATE TABLE IF NOT EXISTS sectors (
+    id BIGSERIAL PRIMARY KEY,
+    code VARCHAR(10) NOT NULL UNIQUE,
+    name VARCHAR(80) NOT NULL,
+    geom GEOMETRY(Polygon, 4326) NOT NULL
+);
+
+-- Spatial index that backs the ST_Contains sector lookup.
+CREATE INDEX IF NOT EXISTS idx_sectors_geom ON sectors USING GIST (geom);
+
+-- Idempotent seed: the unique code makes re-running the migration a no-op.
+INSERT INTO sectors (code, name, geom) VALUES
+    ('N90', 'New York TRACON',
+     ST_GeomFromText('POLYGON((-73.18 40.75, -73.3909 41.1389, -73.9 41.3, -74.4091 41.1389, -74.62 40.75, -74.4091 40.3611, -73.9 40.2, -73.3909 40.3611, -73.18 40.75))', 4326)),
+    ('A90', 'Boston TRACON',
+     ST_GeomFromText('POLYGON((-70.41 42.37, -70.5857 42.6882, -71.01 42.82, -71.4343 42.6882, -71.61 42.37, -71.4343 42.0518, -71.01 41.92, -70.5857 42.0518, -70.41 42.37))', 4326)),
+    ('PHL', 'Philadelphia TRACON',
+     ST_GeomFromText('POLYGON((-74.66 39.87, -74.8299 40.1882, -75.24 40.32, -75.6501 40.1882, -75.82 39.87, -75.6501 39.5518, -75.24 39.42, -74.8299 39.5518, -74.66 39.87))', 4326)),
+    ('PCT', 'Potomac TRACON',
+     ST_GeomFromText('POLYGON((-76.3 38.95, -76.505 39.3389, -77.0 39.5, -77.495 39.3389, -77.7 38.95, -77.495 38.5611, -77.0 38.4, -76.505 38.5611, -76.3 38.95))', 4326))
+ON CONFLICT (code) DO NOTHING;

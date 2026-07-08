@@ -112,6 +112,16 @@
             white-space: normal;
             color: #a02835;
         }
+
+        /* Airspace sector label drawn at each polygon's center. */
+        .sector-label {
+            color: #6f42c1;
+            font-weight: 700;
+            font-size: 12px;
+            text-shadow: 0 0 3px #fff, 0 0 3px #fff, 0 0 3px #fff;
+            white-space: nowrap;
+            pointer-events: none;
+        }
     </style>
 </head>
 <body>
@@ -142,8 +152,8 @@
             crossorigin=""></script>
 
     <script>
-        // Center on the New York City metro airspace.
-        const map = L.map('map').setView([40.7, -73.95], 9);
+        // Center on the US Northeast (Boston-New York-Washington) corridor.
+        const map = L.map('map').setView([40.5, -74.0], 7);
 
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             attribution: '© OpenStreetMap contributors',
@@ -153,6 +163,7 @@
         // Same-origin when served by the API; absolute when opened from disk.
         const API_BASE = location.protocol === 'file:' ? 'http://localhost:8000' : '';
         const FLIGHTS_URL = API_BASE + '/flights';
+        const SECTORS_URL = API_BASE + '/sectors';
         const POLL_INTERVAL_MS = 10000;
 
         const NORMAL_STYLE = {
@@ -197,6 +208,8 @@
             body.appendChild(popupRow('Velocity', formatSpeed(props.velocity)));
             body.appendChild(popupRow('Heading',
                 props.heading != null ? props.heading.toFixed(1) + '°' : 'N/A'));
+            body.appendChild(popupRow('Sector',
+                props.sector ? props.sector + ' (' + props.sector_code + ')' : 'En route'));
 
             const anomaly = props.anomaly;
             if (anomaly) {
@@ -346,6 +359,37 @@
             }
         }
 
+        // Airspace sector polygons, fetched once from the API (PostGIS-backed)
+        // and drawn as translucent labeled overlays beneath the aircraft.
+        async function loadSectors() {
+            try {
+                const response = await fetch(SECTORS_URL);
+                if (!response.ok) return;
+                const geojson = await response.json();
+                L.geoJSON(geojson, {
+                    interactive: false,
+                    style: {
+                        color: '#6f42c1', weight: 1.5,
+                        fillColor: '#6f42c1', fillOpacity: 0.08
+                    }
+                }).addTo(map);
+                geojson.features.forEach(feature => {
+                    const center = L.geoJSON(feature).getBounds().getCenter();
+                    L.marker(center, {
+                        interactive: false,
+                        icon: L.divIcon({
+                            className: 'sector-label',
+                            html: feature.properties.code,
+                            iconSize: [40, 16]
+                        })
+                    }).addTo(map);
+                });
+            } catch (error) {
+                console.error('Error loading sectors:', error);
+            }
+        }
+
+        loadSectors();
         fetchAndUpdateFlights();
         setInterval(fetchAndUpdateFlights, POLL_INTERVAL_MS);
     </script>

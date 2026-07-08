@@ -1,6 +1,6 @@
 # Real-Time Geospatial Anomaly Detector
 
-A distributed intelligence pipeline that ingests live flight telemetry over the New York City metro airspace (JFK, LaGuardia, Newark, and Teterboro), flags aircraft whose implied acceleration (ground-speed change over the time gap) exceeds a configurable threshold, and visualizes those outliers — with the kinematic evidence behind every flag — for operator review.
+A distributed intelligence pipeline that ingests live flight telemetry over the US Northeast corridor (the Boston–New York–Washington airspace), flags aircraft whose implied acceleration (ground-speed change over the time gap) exceeds a configurable threshold, classifies each aircraft into its airspace sector with a PostGIS spatial join, and visualizes those outliers — with the kinematic evidence behind every flag — for operator review.
 
 ## 🎯 Project Goal
 To move beyond static data analysis and build a **living system** that can:
@@ -12,10 +12,10 @@ To move beyond static data analysis and build a **living system** that can:
 ## 🏗 System Architecture
 The system follows a microservices architecture, fully containerized with Docker:
 
-* **Ingestor Service (Python):** Polls OpenSky `/states/all` for the configured bounding box (default: the New York City metro airspace — JFK, LaGuardia, Newark, and Teterboro). Handles rate limiting with exponential backoff and `Retry-After`, supports optional OAuth2 client credentials, filters out on-ground traffic and null coordinates, batch-inserts idempotently (`execute_values` + `ON CONFLICT DO NOTHING`), and prunes history past the retention window.
-* **Persistence Layer (PostgreSQL + PostGIS):** Positions stored as SRID-4326 geometry with a composite `(icao24, last_contact)` unique index backing every window query. Schema is managed by idempotent migrations that each service applies at startup under an advisory lock — no manual migration step, no drift between fresh and long-running databases.
+* **Ingestor Service (Python):** Polls OpenSky `/states/all` for the configured bounding box (default: the US Northeast corridor — the Boston–New York–Washington airspace, covering BOS, the New York airports, PHL, and the DC/Baltimore airports). Handles rate limiting with exponential backoff and `Retry-After`, supports optional OAuth2 client credentials, filters out on-ground traffic and null coordinates, batch-inserts idempotently (`execute_values` + `ON CONFLICT DO NOTHING`), and prunes history past the retention window.
+* **Persistence Layer (PostgreSQL + PostGIS):** Positions stored as SRID-4326 geometry with a composite `(icao24, last_contact)` unique index backing every window query. A `sectors` table holds airspace-sector polygons (`GEOMETRY(Polygon, 4326)`) with their own GiST index, and the API classifies each aircraft into the sector it currently falls in via a GiST-indexed `ST_Contains` spatial join — a real spatial predicate the query planner serves from `idx_sectors_geom`, not application-layer point-in-polygon math. Schema is managed by idempotent migrations that each service applies at startup under an advisory lock — no manual migration step, no drift between fresh and long-running databases.
 * **Intelligence/Detector (Python):** A decoupled worker that compares consecutive observations per aircraft inside a sliding window. An implied acceleration (ground-speed change divided by the time gap) above the threshold — between observations close enough in time to be comparable — is persisted to `anomaly_events` with the full evidence: speed before/after, delta, time gap, and implied acceleration in m/s². Detection stays isolated from ingestion, so a slow query never blocks data capture.
-* **API & Frontend (FastAPI + Leaflet):** The API serves the map itself at `/` and a GeoJSON feed at `/flights` that joins latest positions with recent anomaly evidence. The UI prioritizes **alert hierarchy** — normal traffic is blue/static, anomalies are red/pulsing — and every anomaly popup explains the detection in one line, e.g. *"Implied acceleration 3.4 m/s² over 8s exceeds the 2.0 m/s² threshold"*. The newest anomaly's popup opens automatically.
+* **API & Frontend (FastAPI + Leaflet):** The API serves the map itself at `/`, a GeoJSON feed at `/flights` that joins latest positions with recent anomaly evidence and annotates each aircraft with its current airspace sector, and the sector polygons at `/sectors`. The UI prioritizes **alert hierarchy** — normal traffic is blue/static, anomalies are red/pulsing — draws the airspace sectors as translucent labeled overlays, and every anomaly popup explains the detection in one line, e.g. *"Implied acceleration 3.4 m/s² over 8s exceeds the 2.0 m/s² threshold"*. The newest anomaly's popup opens automatically.
 
 ## 🚀 How to Run
 Prerequisites: Docker & Docker Compose.
@@ -29,7 +29,7 @@ Prerequisites: Docker & Docker Compose.
     ```bash
     cp .env.example .env
     ```
-    Everything runs with defaults, but OpenSky's anonymous tier only grants ~400 API credits/day (the default NYC metro bounding box costs 1 credit per request). A free OpenSky account gets 4,000/day — create an API client under *Account → API Client* and put the credentials in `.env`.
+    Everything runs with defaults, but OpenSky's anonymous tier only grants ~400 API credits/day (the default US Northeast corridor bounding box costs 2 credits per request). A free OpenSky account gets 4,000/day — create an API client under *Account → API Client* and put the credentials in `.env`.
 3.  **Start the pipeline:**
     ```bash
     docker compose up --build -d
@@ -47,7 +47,7 @@ pytest
 ```
 
 ## 🧠 Technical Decisions & Trade-offs
-* **PostGIS from day one:** Positions are stored as indexed geometry rather than bare floats, so spatial predicates (corridor filters, sector polygons) become database queries instead of application-layer math as the feature set grows.
+* **PostGIS from day one:** Positions are stored as indexed geometry rather than bare floats, and that geometry does real work — aircraft are classified into airspace sectors by a GiST-indexed `ST_Contains` spatial join against a `sectors` polygon table, so point-in-polygon runs in the database rather than as application-layer math. The same foundation extends to corridor filters and sector analytics.
 * **Decoupled architecture:** By separating the *Detector* from the *Ingestor*, the system stays resilient — if analysis hangs on a complex query, ingestion continues uninterrupted.
 * **Evidence over flags:** The detector persists *why* an anomaly fired (delta-v, time gap, implied acceleration), so the API reads detection results instead of re-deriving them — one source of truth, and alerts survive restarts.
 * **Idempotency everywhere:** OpenSky re-serves a state vector when an aircraft hasn't transmitted between polls; the `(icao24, last_contact)` unique key makes re-ingestion and re-detection no-ops rather than data corruption.

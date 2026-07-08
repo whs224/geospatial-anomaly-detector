@@ -5,6 +5,7 @@ Serves the Leaflet map at / and a GeoJSON feed of latest flight positions at
 /flights, annotated with the anomaly evidence the detector persisted.
 """
 
+import json
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -27,17 +28,48 @@ INDEX_PATH = Path(__file__).resolve().parent / 'index.html'
 # Latest position per currently-active aircraft. The recency filter keeps the
 # scan bounded and stops long-departed aircraft from rendering forever.
 LATEST_POSITIONS_QUERY = """
-    SELECT DISTINCT ON (icao24)
-        icao24,
-        callsign,
-        velocity,
-        heading,
-        last_contact,
-        ST_X(geom) AS longitude,
-        ST_Y(geom) AS latitude
-    FROM flight_positions
-    WHERE last_contact >= now() - make_interval(secs => %(active_window)s)
-    ORDER BY icao24, last_contact DESC
+    WITH latest AS (
+        SELECT DISTINCT ON (icao24)
+            icao24,
+            callsign,
+            velocity,
+            heading,
+            last_contact,
+            geom
+        FROM flight_positions
+        WHERE last_contact >= now() - make_interval(secs => %(active_window)s)
+        ORDER BY icao24, last_contact DESC
+    )
+    -- Classify each aircraft into the airspace sector whose polygon contains
+    -- its current position. ST_Contains is GiST-servable via idx_sectors_geom;
+    -- LATERAL ... LIMIT 1 yields one sector per aircraft even if polygons
+    -- overlap, and LEFT JOIN leaves en-route aircraft (in no sector) as NULL.
+    SELECT
+        latest.icao24,
+        latest.callsign,
+        latest.velocity,
+        latest.heading,
+        latest.last_contact,
+        ST_X(latest.geom) AS longitude,
+        ST_Y(latest.geom) AS latitude,
+        sector.code AS sector_code,
+        sector.name AS sector_name
+    FROM latest
+    LEFT JOIN LATERAL (
+        SELECT s.code, s.name
+        FROM sectors s
+        WHERE ST_Contains(s.geom, latest.geom)
+        ORDER BY s.id
+        LIMIT 1
+    ) sector ON true
+    ORDER BY latest.icao24
+"""
+
+# Sector polygons served to the map as GeoJSON.
+SECTORS_QUERY = """
+    SELECT code, name, ST_AsGeoJSON(geom) AS geojson
+    FROM sectors
+    ORDER BY code
 """
 
 # Most recent anomaly event per aircraft inside the display window.
@@ -138,13 +170,16 @@ def get_flights(request: Request) -> Dict[str, Any]:
         pool.putconn(conn)
 
     features = []
-    for icao24, callsign, velocity, heading, last_contact, lon, lat in rows:
+    for (icao24, callsign, velocity, heading, last_contact, lon, lat,
+         sector_code, sector_name) in rows:
         properties: Dict[str, Any] = {
             'icao24': icao24,
             'callsign': callsign or 'UNKNOWN',
             'velocity': velocity,
             'heading': heading,
             'last_contact': last_contact.isoformat(),
+            'sector': sector_name,
+            'sector_code': sector_code,
             'is_anomaly': icao24 in anomalies,
         }
         if icao24 in anomalies:
@@ -155,6 +190,42 @@ def get_flights(request: Request) -> Dict[str, Any]:
             'properties': properties,
         })
 
+    return {'type': 'FeatureCollection', 'features': features}
+
+
+@app.get('/sectors')
+def get_sectors(request: Request) -> Dict[str, Any]:
+    """Airspace sector polygons as a GeoJSON FeatureCollection for the map."""
+    pool = request.app.state.pool
+    try:
+        conn = pool.getconn()
+    except psycopg2.Error as exc:
+        logger.error('Could not get database connection: %s', exc)
+        raise HTTPException(status_code=503, detail='database unavailable')
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(SECTORS_QUERY)
+            rows = cursor.fetchall()
+        conn.commit()
+    except psycopg2.Error as exc:
+        try:
+            conn.rollback()
+        except psycopg2.Error:
+            pass
+        logger.exception('Database error serving /sectors')
+        raise HTTPException(status_code=500, detail='database error') from exc
+    finally:
+        pool.putconn(conn)
+
+    features = [
+        {
+            'type': 'Feature',
+            'geometry': json.loads(geojson),
+            'properties': {'code': code, 'name': name},
+        }
+        for code, name, geojson in rows
+    ]
     return {'type': 'FeatureCollection', 'features': features}
 
 
