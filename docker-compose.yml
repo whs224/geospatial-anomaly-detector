@@ -7,10 +7,10 @@ x-app-env: &app-env
   # Tunables shared by the services; each reads only the ones it needs.
   # Unset variables fall back to the defaults defined in config.py.
   FETCH_INTERVAL_SECONDS: ${FETCH_INTERVAL_SECONDS:-10}
-  BBOX_LAMIN: ${BBOX_LAMIN:-47.0}
-  BBOX_LOMIN: ${BBOX_LOMIN:-6.0}
-  BBOX_LAMAX: ${BBOX_LAMAX:-49.0}
-  BBOX_LOMAX: ${BBOX_LOMAX:-12.0}
+  BBOX_LAMIN: ${BBOX_LAMIN:-40.4}
+  BBOX_LOMIN: ${BBOX_LOMIN:--74.3}
+  BBOX_LAMAX: ${BBOX_LAMAX:-41.0}
+  BBOX_LOMAX: ${BBOX_LOMAX:--73.6}
   ACCEL_THRESHOLD_MS2: ${ACCEL_THRESHOLD_MS2:-2.0}
   MAX_TIME_GAP_SECONDS: ${MAX_TIME_GAP_SECONDS:-}
   DETECTION_INTERVAL_SECONDS: ${DETECTION_INTERVAL_SECONDS:-10}
