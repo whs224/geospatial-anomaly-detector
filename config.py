@@ -53,12 +53,14 @@ OPENSKY_CLIENT_ID = _env_str('OPENSKY_CLIENT_ID', '')
 OPENSKY_CLIENT_SECRET = _env_str('OPENSKY_CLIENT_SECRET', '')
 
 # --- Ingestion ---------------------------------------------------------------
-# Switzerland bounding box (~9 square degrees). At this size each /states/all
-# request costs 1 API credit, so the fast fetch cadence stays cheap.
-BBOX_LAMIN = _env_float('BBOX_LAMIN', 45.8)
-BBOX_LOMIN = _env_float('BBOX_LOMIN', 5.9)
-BBOX_LAMAX = _env_float('BBOX_LAMAX', 47.8)
-BBOX_LOMAX = _env_float('BBOX_LOMAX', 10.5)
+# Central-European enroute corridor (~12 square degrees): northern Switzerland,
+# southern Germany, and the western Austrian approach — the dense Basel-Zurich-
+# Munich traffic lane. At this size each /states/all request still costs 1 API
+# credit, so the fast fetch cadence stays cheap.
+BBOX_LAMIN = _env_float('BBOX_LAMIN', 47.0)
+BBOX_LOMIN = _env_float('BBOX_LOMIN', 6.0)
+BBOX_LAMAX = _env_float('BBOX_LAMAX', 49.0)
+BBOX_LOMAX = _env_float('BBOX_LOMAX', 12.0)
 
 FETCH_INTERVAL_SECONDS = _env_int('FETCH_INTERVAL_SECONDS', 10)
 # Cap for exponential backoff after failed or rate-limited fetches.
